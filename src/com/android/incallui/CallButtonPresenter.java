@@ -18,20 +18,22 @@ package com.android.incallui;
 
 import android.app.AlertDialog;
 import android.content.Context;
+import android.content.DialogInterface;
+import android.content.SharedPreferences;
+import android.os.Bundle;
 import android.telecom.AudioState;
 import android.telecom.InCallService.VideoCall;
-import android.telecom.PhoneCapabilities;
 import android.telecom.VideoProfile;
+import android.telephony.PhoneNumberUtils;
+import android.text.TextUtils;
 
 import com.android.incallui.AudioModeProvider.AudioModeListener;
+import com.android.incallui.InCallCameraManager.CameraSelectionListener;
 import com.android.incallui.InCallPresenter.CanAddCallListener;
 import com.android.incallui.InCallPresenter.InCallState;
 import com.android.incallui.InCallPresenter.InCallStateListener;
 import com.android.incallui.InCallPresenter.IncomingCallListener;
 import com.android.incallui.InCallPresenter.InCallDetailsListener;
-
-import android.content.DialogInterface;
-import android.telephony.PhoneNumberUtils;
 import com.android.internal.telephony.util.BlacklistUtils;
 
 import java.util.Objects;
@@ -41,7 +43,12 @@ import java.util.Objects;
  */
 public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButtonUi>
         implements InCallStateListener, AudioModeListener, IncomingCallListener,
-        InCallDetailsListener, CallList.ActiveSubChangeListener, CanAddCallListener {
+        InCallDetailsListener, CallList.ActiveSubChangeListener, CanAddCallListener,
+        CameraSelectionListener {
+
+    private static final String KEY_AUTOMATICALLY_MUTED = "incall_key_automatically_muted";
+    private static final String KEY_PREVIOUS_MUTE_STATE = "incall_key_previous_mute_state";
+    private static final String RECORDING_WARNING_PRESENTED = "recording_warning_presented";
 
     private Call mCall;
     private boolean mAutomaticallyMuted = false;
@@ -62,6 +69,8 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         InCallPresenter.getInstance().addDetailsListener(this);
         CallList.getInstance().addActiveSubChangeListener(this);
         InCallPresenter.getInstance().addCanAddCallListener(this);
+        InCallPresenter.getInstance().getInCallCameraManager().addCameraSelectionListener(this,
+            true);
     }
 
     @Override
@@ -73,6 +82,8 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         InCallPresenter.getInstance().removeIncomingCallListener(this);
         InCallPresenter.getInstance().removeDetailsListener(this);
         CallList.getInstance().removeActiveSubChangeListener(this);
+        InCallPresenter.getInstance().removeCanAddCallListener(this);
+        InCallPresenter.getInstance().getInCallCameraManager().removeCameraSelectionListener(this);
     }
 
     @Override
@@ -89,9 +100,10 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
             // OUTGOING.  We may want to do that once we start showing "Voice mail" label on
             // the dialpad too.)
             if (ui != null) {
-                if (oldState == InCallState.OUTGOING && mCall != null
-                        && PhoneNumberUtils.isVoiceMailNumber(mCall.getNumber())) {
-                    ui.displayDialpad(true /* show */, true /* animate */);
+                if (oldState == InCallState.OUTGOING && mCall != null) {
+                    if (CallerInfoUtils.isVoiceMailNumber(ui.getContext(), mCall)) {
+                        ui.displayDialpad(true /* show */, true /* animate */);
+                    }
                 }
             }
         } else if (newState == InCallState.INCOMING) {
@@ -236,7 +248,6 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         mPreviousMuteState = AudioModeProvider.getInstance().getMute();
         // Simulate a click on the mute button
         muteClicked(true);
-
         TelecomAdapter.getInstance().addCall();
     }
 
@@ -289,11 +300,15 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
 
         String cameraId = cameraManager.getActiveCameraId();
         if (cameraId != null) {
+            final int cameraDir = cameraManager.isUsingFrontFacingCamera()
+                    ? Call.VideoSettings.CAMERA_DIRECTION_FRONT_FACING
+                    : Call.VideoSettings.CAMERA_DIRECTION_BACK_FACING;
+            mCall.getVideoSettings().setCameraDir(cameraDir);
             videoCall.setCamera(cameraId);
             videoCall.requestCameraCapabilities();
         }
-        getUi().setSwitchCameraButton(!useFrontFacingCamera);
     }
+
 
     /**
      * Stop or start client's video transmission.
@@ -322,6 +337,63 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         getUi().setPauseVideoButton(pause);
     }
 
+    public void callRecordClicked(boolean startRecording) {
+        CallRecorder recorder = CallRecorder.getInstance();
+        if (startRecording) {
+            Context context = getUi().getContext();
+            final SharedPreferences prefs = InCallApp.getPrefs(context);
+            boolean warningPresented = prefs
+                    .getBoolean(RECORDING_WARNING_PRESENTED, false);
+            if (!warningPresented) {
+                new AlertDialog.Builder(context)
+                        .setTitle(R.string.recording_warning_title)
+                        .setMessage(R.string.recording_warning_text)
+                        .setPositiveButton(R.string.menu_start_record,
+                                new DialogInterface.OnClickListener() {
+                                    @Override
+                                    public void onClick(DialogInterface dialog, int which) {
+                                        prefs
+                                                .edit()
+                                                .putBoolean(RECORDING_WARNING_PRESENTED, true)
+                                                .apply();
+                                        callRecordClicked(true);
+                                    }
+                                })
+                        .setNegativeButton(android.R.string.cancel, null)
+                        .create()
+                        .show();
+                return;
+            }
+            recorder.startRecording(mCall.getNumber(),
+                    mCall.getCreateTimeMillis());
+        } else if (recorder.isRecording()) {
+            recorder.finishRecording();
+        }
+        getUi().setCallRecordButton(recorder.isRecording());
+    }
+
+    public void addToBlacklistClicked() {
+        final String number = mCall.getNumber();
+        final Context context = getUi().getContext();
+        final String message = context.getString(R.string.blacklist_dialog_message, number);
+
+        new AlertDialog.Builder(context)
+                .setTitle(R.string.blacklist_dialog_title)
+                .setMessage(message)
+                .setPositiveButton(R.string.pause_prompt_yes,
+                        new DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(DialogInterface dialog, int which) {
+                        Log.d(this, "hanging up due to blacklist: " + mCall.getId());
+                        TelecomAdapter.getInstance().disconnectCall(mCall.getId());
+                        BlacklistUtils.addOrUpdate(context, number,
+                                BlacklistUtils.BLOCK_CALLS, BlacklistUtils.BLOCK_CALLS);
+                    }
+                })
+                .setNegativeButton(R.string.pause_prompt_no, null)
+                .show();
+    }
+
     private void updateUi(InCallState state, Call call) {
         Log.d(this, "Updating call UI for call: ", call);
 
@@ -340,7 +412,7 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
 
         updateCallButtons(call, ui.getContext());
 
-        ui.enableMute(call.can(PhoneCapabilities.MUTE));
+        ui.enableMute(call.can(android.telecom.Call.Details.CAPABILITY_MUTE));
     }
 
     /**
@@ -350,104 +422,263 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
      * @param context The context.
      */
     private void updateCallButtons(Call call, Context context) {
-        if (call.isVideoCall(context)) {
-            updateVoiceCallButtons(call);
-            updateVideoCallButtons();
+        if (CallUtils.isVideoCall(call)) {
+            updateVideoCallButtons(call);
         } else {
             updateVoiceCallButtons(call);
         }
     }
 
-    private void updateVideoCallButtons() {
+    private void updateVideoCallButtons(Call call) {
         Log.v(this, "Showing buttons for video call.");
         final CallButtonUi ui = getUi();
+        final Context context = ui.getContext();
+        final int maxButtonCount =
+                context.getResources().getInteger(R.integer.max_call_button_count);
+
+        // Hide all voice-call-related buttons.
+        ui.showAudioButton(false);
+        ui.showDialpadButton(false);
+        ui.showSwapButton(false);
+        ui.showChangeToVideoButton(false);
+        ui.showAddCallButton(false);
+        ui.showMergeButton(false);
+        ui.showCallRecordButton(false);
 
         // Show all video-call-related buttons.
+        ui.showChangeToVoiceButton(true);
         ui.showSwitchCameraButton(true);
-        ui.showPauseVideoButton(false);
+        ui.showPauseVideoButton(true);
+
+        boolean showAddToBlacklistOption = !TextUtils.isEmpty(call.getNumber())
+                && BlacklistUtils.isBlacklistEnabled(context);
+        boolean showAddParticipantOption = call.can(android.telecom.Call.Details.ADD_PARTICIPANT);
+        boolean showManageVideoCallConferenceOption =
+                call.can(android.telecom.Call.Details.CAPABILITY_MANAGE_CONFERENCE);
+        final boolean supportHold = call.can(android.telecom.Call.Details.CAPABILITY_SUPPORT_HOLD);
+        final boolean enableHoldOption = call.can(android.telecom.Call.Details.CAPABILITY_HOLD);
+
+        ui.showHoldButton(supportHold);
+        ui.enableHold(enableHoldOption);
+        ui.setHold(call.getState() == Call.State.ONHOLD);
+
+        int activeButtonCount = supportHold ? 4 : 3;
+        int buttonCount = activeButtonCount;
+        if (showAddParticipantOption) buttonCount++;
+        if (showAddToBlacklistOption) buttonCount++;
+        if (showManageVideoCallConferenceOption) buttonCount++;
+
+        boolean needOverflow = buttonCount > maxButtonCount;
+        int populatableButtonCount = maxButtonCount;
+        if (needOverflow) {
+            populatableButtonCount--;
+        }
+
+        if (showAddParticipantOption && activeButtonCount < populatableButtonCount) {
+            ui.showAddParticipantButton(true);
+            showAddParticipantOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showAddParticipantButton(false);
+        }
+        if (showManageVideoCallConferenceOption && activeButtonCount < populatableButtonCount) {
+            ui.showManageConferenceVideoCallButton(true);
+            showManageVideoCallConferenceOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showManageConferenceVideoCallButton(false);
+        }
+        if (showAddToBlacklistOption && activeButtonCount < populatableButtonCount) {
+            ui.showAddToBlacklistButton(true);
+            showAddToBlacklistOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showAddToBlacklistButton(false);
+        }
+
+        if (needOverflow) {
+            ui.configureOverflowMenu(
+                    false /* showMergeOption */, false /* showAddMenuOption */,
+                    false /* showHoldMenuOption */, false /* showSwapOption */,
+                    showAddParticipantOption,
+                    showManageVideoCallConferenceOption,
+                    false /* showCallRecordOption */, showAddToBlacklistOption);
+            ui.showOverflowButton(true);
+        } else {
+            ui.showOverflowButton(false);
+        }
+    }
+
+    private boolean canShowMergeOption() {
+        CallList callList = CallList.getInstance();
+        Call activeCall = callList.getActiveCall(), backgroundCall = callList.getBackgroundCall();
+        boolean activeCallCanMerge  =
+                (activeCall != null) &&
+                activeCall.can(android.telecom.Call.Details.CAPABILITY_MERGE_CONFERENCE);
+        boolean backgroundCallCanMerge =
+                (backgroundCall != null) &&
+                backgroundCall.can(android.telecom.Call.Details.CAPABILITY_MERGE_CONFERENCE);
+        String acId = (activeCall != null) ? activeCall.getId() : "null";
+        String bcId = (backgroundCall != null) ? backgroundCall.getId() : "null";
+        Log.v(this, "canShowMergeOption: " + acId + " " + activeCallCanMerge +
+                " " + bcId + " " + backgroundCallCanMerge);
+        return activeCallCanMerge && backgroundCallCanMerge;
     }
 
     private void updateVoiceCallButtons(Call call) {
         Log.v(this, "Showing buttons for voice call.");
         final CallButtonUi ui = getUi();
+        final Context context = ui.getContext();
+        final int maxButtonCount =
+                context.getResources().getInteger(R.integer.max_call_button_count);
 
         // Hide all video-call-related buttons.
         ui.showChangeToVoiceButton(false);
         ui.showSwitchCameraButton(false);
         ui.showPauseVideoButton(false);
+        ui.showManageConferenceVideoCallButton(false);
 
         // Show all voice-call-related buttons.
         ui.showAudioButton(true);
         ui.showDialpadButton(true);
 
-        Log.v(this, "Show hold ", call.can(PhoneCapabilities.SUPPORT_HOLD));
-        Log.v(this, "Enable hold", call.can(PhoneCapabilities.HOLD));
-        Log.v(this, "Show merge ", call.can(PhoneCapabilities.MERGE_CONFERENCE));
-        Log.v(this, "Show swap ", call.can(PhoneCapabilities.SWAP_CONFERENCE));
+        Log.v(this, "Show hold ", call.can(android.telecom.Call.Details.CAPABILITY_SUPPORT_HOLD));
+        Log.v(this, "Enable hold", call.can(android.telecom.Call.Details.CAPABILITY_HOLD));
+        Log.v(this, "Show merge ", call.can(
+                android.telecom.Call.Details.CAPABILITY_MERGE_CONFERENCE));
+        Log.v(this, "Show swap ", call.can(
+                android.telecom.Call.Details.CAPABILITY_SWAP_CONFERENCE));
         Log.v(this, "Show add call ", TelecomAdapter.getInstance().canAddCall());
-        Log.v(this, "Show mute ", call.can(PhoneCapabilities.MUTE));
-        Log.v(this, "Show video call local:", call.can(PhoneCapabilities.SUPPORTS_VT_LOCAL)
-                + " remote: " + call.can(PhoneCapabilities.SUPPORTS_VT_REMOTE));
+        Log.v(this, "Show mute ", call.can(android.telecom.Call.Details.CAPABILITY_MUTE));
+        Log.v(this, "Show video call local:",
+                call.can(android.telecom.Call.Details.CAPABILITY_SUPPORTS_VT_LOCAL)
+                + " remote: " + call.can(android.telecom.Call.Details.CAPABILITY_SUPPORTS_VT_REMOTE));
 
         final boolean canAdd = TelecomAdapter.getInstance().canAddCall();
-        final boolean enableHoldOption = call.can(PhoneCapabilities.HOLD);
-        final boolean supportHold = call.can(PhoneCapabilities.SUPPORT_HOLD);
+        final boolean enableHoldOption = call.can(android.telecom.Call.Details.CAPABILITY_HOLD);
+        final boolean supportHold = call.can(android.telecom.Call.Details.CAPABILITY_SUPPORT_HOLD);
+        final boolean isCallOnHold = call.getState() == Call.State.ONHOLD;
 
-        boolean canVideoCall = call.can(PhoneCapabilities.SUPPORTS_VT_LOCAL)
-                && call.can(PhoneCapabilities.SUPPORTS_VT_REMOTE)
-                && call.can(PhoneCapabilities.CALL_TYPE_MODIFIABLE);
-        ui.showChangeToVideoButton(canVideoCall);
+        boolean canVideoCall = call.can(android.telecom.Call.Details.CAPABILITY_SUPPORTS_VT_LOCAL)
+                && call.can(android.telecom.Call.Details.CAPABILITY_SUPPORTS_VT_REMOTE);
+        ui.enableChangeToVideoButton(!isCallOnHold);
 
-        final boolean showMergeOption = call.can(PhoneCapabilities.MERGE_CONFERENCE);
-        final boolean showAddCallOption = canAdd;
+        boolean showMergeOption = call.can(
+                android.telecom.Call.Details.CAPABILITY_MERGE_CONFERENCE);
+        boolean showAddCallOption = canAdd;
+        boolean showAddParticipantOption = call.can(android.telecom.Call.Details.ADD_PARTICIPANT);
+        boolean showManageVideoCallConferenceOption = call.can(
+            android.telecom.Call.Details.CAPABILITY_MANAGE_CONFERENCE) && CallUtils.isVideoCall(call);
 
         // Show either HOLD or SWAP, but not both. If neither HOLD or SWAP is available:
         //     (1) If the device normally can hold, show HOLD in a disabled state.
         //     (2) If the device doesn't have the concept of hold/swap, remove the button.
-        final boolean showSwapOption = call.can(PhoneCapabilities.SWAP_CONFERENCE);
-        final boolean showHoldOption = !showSwapOption && (enableHoldOption || supportHold);
+        boolean showSwapOption = call.can(android.telecom.Call.Details.CAPABILITY_SWAP_CONFERENCE);
+        boolean showHoldOption = !showSwapOption && (enableHoldOption || supportHold);
+        ui.setHold(isCallOnHold);
 
-        ui.setHold(call.getState() == Call.State.ONHOLD);
-        // If we show video upgrade and add/merge and hold/swap, the overflow menu is needed.
-        final boolean isVideoOverflowScenario = canVideoCall
-                && (showAddCallOption || showMergeOption) && (showHoldOption || showSwapOption);
-        // If we show hold/swap, add, and merge simultaneously, the overflow menu is needed.
-        final boolean isOverflowScenario =
-                (showHoldOption || showSwapOption) && showMergeOption && showAddCallOption;
+        boolean showAddToBlacklistOption = !TextUtils.isEmpty(call.getNumber())
+                && BlacklistUtils.isBlacklistEnabled(context);
 
-        if (isVideoOverflowScenario) {
+        final CallRecorder recorder = CallRecorder.getInstance();
+        boolean showCallRecordOption =
+                recorder.isEnabled() && call.getState() == Call.State.ACTIVE;
+        ui.setCallRecordButton(showCallRecordOption && recorder.isRecording());
+
+        int activeButtonCount = 3; // audio, mute, dialpad
+        int buttonCount = activeButtonCount;
+        if (showHoldOption) buttonCount++;
+        if (showSwapOption) buttonCount++;
+        if (canVideoCall) buttonCount++;
+        if (showAddCallOption) buttonCount++;
+        if (showMergeOption) buttonCount++;
+        if (showAddParticipantOption) buttonCount++;
+        if (showAddToBlacklistOption) buttonCount++;
+        if (showCallRecordOption) buttonCount++;
+
+        if (buttonCount == (maxButtonCount + 1) && showHoldOption && !enableHoldOption) {
+            // don't populate a hold button that is disabled anyway
+            buttonCount--;
+        }
+
+        boolean needOverflow = buttonCount > maxButtonCount;
+        int populatableButtonCount = maxButtonCount;
+        if (needOverflow) {
+            populatableButtonCount--;
+        }
+
+        if (showHoldOption && (enableHoldOption || !needOverflow)
+                && activeButtonCount < populatableButtonCount) {
+            ui.showHoldButton(true);
+            showHoldOption = false;
+            activeButtonCount++;
+        } else {
             ui.showHoldButton(false);
-            ui.showSwapButton(false);
+        }
+        if (canVideoCall && activeButtonCount < populatableButtonCount) {
+            ui.showChangeToVideoButton(true);
+            ui.showHoldButton(true);
+            canVideoCall = false;
+            activeButtonCount++;
+        } else {
+            ui.showChangeToVideoButton(false);
+        }
+        if (showAddCallOption && activeButtonCount < populatableButtonCount) {
+            ui.showAddCallButton(true);
+            showAddCallOption = false;
+            activeButtonCount++;
+        } else {
             ui.showAddCallButton(false);
+        }
+        if (showSwapOption && activeButtonCount < populatableButtonCount) {
+            ui.showSwapButton(true);
+            showSwapOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showSwapButton(false);
+        }
+        if (showMergeOption && activeButtonCount < populatableButtonCount) {
+            ui.showMergeButton(true);
+            showMergeOption = false;
+            activeButtonCount++;
+        } else {
             ui.showMergeButton(false);
+        }
+        if (showAddParticipantOption && activeButtonCount < populatableButtonCount) {
+            ui.showAddParticipantButton(true);
+            showAddParticipantOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showAddParticipantButton(false);
+        }
+        if (showCallRecordOption && activeButtonCount < populatableButtonCount) {
+            ui.showCallRecordButton(true);
+            showCallRecordOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showCallRecordButton(false);
+        }
+        if (showAddToBlacklistOption && activeButtonCount < populatableButtonCount) {
+            ui.showAddToBlacklistButton(true);
+            showAddToBlacklistOption = false;
+            activeButtonCount++;
+        } else {
+            ui.showAddToBlacklistButton(false);
+        }
 
+        if (needOverflow) {
             ui.configureOverflowMenu(
                     showMergeOption,
                     showAddCallOption /* showAddMenuOption */,
                     showHoldOption && enableHoldOption /* showHoldMenuOption */,
-                    showSwapOption);
+                    showSwapOption,
+                    showAddParticipantOption,
+                    false /* showManageVideoCallConferenceOption */,
+                    showCallRecordOption,
+                    showAddToBlacklistOption);
             ui.showOverflowButton(true);
         } else {
-            if (isOverflowScenario) {
-                ui.showAddCallButton(false);
-                ui.showMergeButton(false);
-
-                ui.configureOverflowMenu(
-                        showMergeOption,
-                        showAddCallOption /* showAddMenuOption */,
-                        false /* showHoldMenuOption */,
-                        false /* showSwapMenuOption */);
-            } else {
-                ui.showMergeButton(showMergeOption);
-                ui.showAddCallButton(showAddCallOption);
-                ui.enableAddParticipant(call.can(
-                        PhoneCapabilities.ADD_PARTICIPANT));
-            }
-
-            ui.showOverflowButton(isOverflowScenario);
-            ui.showHoldButton(showHoldOption);
-            ui.enableHold(enableHoldOption);
-            ui.showSwapButton(showSwapOption);
+            ui.showOverflowButton(false);
         }
     }
 
@@ -463,6 +694,22 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         mAutomaticallyMuted = false;
     }
 
+    @Override
+    public void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putBoolean(KEY_AUTOMATICALLY_MUTED, mAutomaticallyMuted);
+        outState.putBoolean(KEY_PREVIOUS_MUTE_STATE, mPreviousMuteState);
+    }
+
+    @Override
+    public void onRestoreInstanceState(Bundle savedInstanceState) {
+        mAutomaticallyMuted =
+                savedInstanceState.getBoolean(KEY_AUTOMATICALLY_MUTED, mAutomaticallyMuted);
+        mPreviousMuteState =
+                savedInstanceState.getBoolean(KEY_PREVIOUS_MUTE_STATE, mPreviousMuteState);
+        super.onRestoreInstanceState(savedInstanceState);
+    }
+
     public interface CallButtonUi extends Ui {
         void setEnabled(boolean on);
         void setMute(boolean on);
@@ -475,13 +722,18 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         void enableHold(boolean enabled);
         void showSwapButton(boolean show);
         void showChangeToVideoButton(boolean show);
+        void enableChangeToVideoButton(boolean enable);
         void showSwitchCameraButton(boolean show);
         void setSwitchCameraButton(boolean isBackFacingCamera);
         void showAddCallButton(boolean show);
-        void enableAddParticipant(boolean show);
+        void showAddParticipantButton(boolean show);
+        void showManageConferenceVideoCallButton(boolean show);
         void showMergeButton(boolean show);
         void showPauseVideoButton(boolean show);
         void setPauseVideoButton(boolean isPaused);
+        void showCallRecordButton(boolean show);
+        void setCallRecordButton(boolean isRecording);
+        void showAddToBlacklistButton(boolean show);
         void showOverflowButton(boolean show);
         void displayDialpad(boolean on, boolean animate);
         void displayModifyCallOptions();
@@ -489,15 +741,25 @@ public class CallButtonPresenter extends Presenter<CallButtonPresenter.CallButto
         void setAudio(int mode);
         void setSupportedAudio(int mask);
         void configureOverflowMenu(boolean showMergeMenuOption, boolean showAddMenuOption,
-                boolean showHoldMenuOption, boolean showSwapMenuOption);
+                boolean showHoldMenuOption, boolean showSwapMenuOption,
+                boolean showAddParticipantOption, boolean showManageConferenceVideoCallOption,
+                boolean showCallRecordOption, boolean showAddToBlacklistOption);
         Context getContext();
     }
 
     @Override
-    public void onActiveSubChanged(long subId) {
+    public void onActiveSubChanged(int subId) {
         InCallState state = InCallPresenter.getInstance()
                 .getPotentialStateFromCallList(CallList.getInstance());
 
         onStateChange(null, state, CallList.getInstance());
+    }
+
+    @Override
+    public void onActiveCameraSelectionChanged(boolean isUsingFrontFacingCamera) {
+        if (getUi() == null) {
+            return;
+        }
+        getUi().setSwitchCameraButton(!isUsingFrontFacingCamera);
     }
 }

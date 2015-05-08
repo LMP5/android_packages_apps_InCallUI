@@ -25,6 +25,8 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.FragmentManager;
 import android.app.FragmentTransaction;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.DialogInterface;
 import android.content.DialogInterface.OnClickListener;
 import android.content.DialogInterface.OnCancelListener;
@@ -32,12 +34,13 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.res.Configuration;
 import android.content.res.TypedArray;
+import android.content.res.Resources;
 import android.graphics.Point;
 import android.net.Uri;
 import android.os.Bundle;
 import android.telecom.DisconnectCause;
-import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
+import android.telecom.TelecomManager;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
@@ -55,6 +58,10 @@ import android.widget.TextView;
 import com.android.phone.common.animation.AnimUtils;
 import com.android.phone.common.animation.AnimationListenerAdapter;
 import com.android.contacts.common.interactions.TouchPointManager;
+import com.android.contacts.common.util.MaterialColorMapUtils;
+import com.android.contacts.common.util.MaterialColorMapUtils.MaterialPalette;
+import com.android.contacts.common.widget.SelectPhoneAccountDialogFragment;
+import com.android.contacts.common.widget.SelectPhoneAccountDialogFragment.SelectPhoneAccountListener;
 import com.android.incallui.Call.State;
 
 import java.util.ArrayList;
@@ -68,11 +75,12 @@ public class InCallActivity extends Activity {
 
     public static final String SHOW_DIALPAD_EXTRA = "InCallActivity.show_dialpad";
     public static final String DIALPAD_TEXT_EXTRA = "InCallActivity.dialpad_text";
-    public static final String NEW_OUTGOING_CALL = "InCallActivity.new_outgoing_call";
     private static final String ACTION_SUPP_SERVICE_FAILURE =
             "org.codeaurora.ACTION_SUPP_SERVICE_FAILURE";
 
     private static final String EXTRA_RESULT = "result";
+    public static final String NEW_OUTGOING_CALL_EXTRA = "InCallActivity.new_outgoing_call";
+    public static final String SHOW_CIRCULAR_REVEAL_EXTRA = "InCallActivity.show_circular_reveal";
 
     private CallButtonFragment mCallButtonFragment;
     private CallCardFragment mCallCardFragment;
@@ -108,6 +116,7 @@ public class InCallActivity extends Activity {
 
     private Tab[] mDsdaTab = new Tab[TAB_COUNT_TWO];
     private boolean[] mDsdaTabAdd = {false, false};
+    private boolean mDismissKeyguard = false;
 
     AnimationListenerAdapter mSlideOutListener = new AnimationListenerAdapter() {
         @Override
@@ -208,10 +217,13 @@ public class InCallActivity extends Activity {
 
     @Override
     protected void onSaveInstanceState(Bundle out) {
+        Log.d(this, "onSaveInstanceState: savedInstanceState = " + out);
+        super.onSaveInstanceState(out);
         out.putBoolean(SHOW_DIALPAD_EXTRA, mCallButtonFragment.isDialpadVisible());
         if (mDialpadFragment != null) {
             out.putString(DIALPAD_TEXT_EXTRA, mDialpadFragment.getDtmfText());
         }
+        super.onSaveInstanceState(out);
     }
 
     @Override
@@ -234,6 +246,8 @@ public class InCallActivity extends Activity {
         super.onResume();
 
         mIsForegroundActivity = true;
+
+        InCallPresenter.getInstance().setThemeColors();
         InCallPresenter.getInstance().onUiShowing(true);
 
         if (mShowDialpadRequested) {
@@ -267,6 +281,9 @@ public class InCallActivity extends Activity {
         }
 
         InCallPresenter.getInstance().onUiShowing(false);
+        if (isFinishing()) {
+            InCallPresenter.getInstance().unsetActivity(this);
+        }
     }
 
     @Override
@@ -281,10 +298,8 @@ public class InCallActivity extends Activity {
     @Override
     protected void onDestroy() {
         Log.d(this, "onDestroy()...  this = " + this);
-
-        InCallPresenter.getInstance().updateIsChangingConfigurations();
-        InCallPresenter.getInstance().setActivity(null);
         unregisterReceiver(mReceiver);
+        InCallPresenter.getInstance().unsetActivity(this);
         super.onDestroy();
     }
 
@@ -347,12 +362,12 @@ public class InCallActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        Log.d(this, "onBackPressed()...");
+        Log.i(this, "onBackPressed");
 
         // BACK is also used to exit out of any "special modes" of the
         // in-call UI:
 
-        if (!mCallCardFragment.isVisible()) {
+        if (!mConferenceManagerFragment.isVisible() && !mCallCardFragment.isVisible()) {
             return;
         }
 
@@ -361,7 +376,7 @@ public class InCallActivity extends Activity {
             mCallButtonFragment.getPresenter().showDialpadClicked(false);
             return;
         } else if (mConferenceManagerFragment.isVisible()) {
-            mConferenceManagerFragment.setVisible(false);
+            showConferenceCallManager(false);
             return;
         }
 
@@ -527,8 +542,8 @@ public class InCallActivity extends Activity {
                 relaunchedFromDialer(showDialpad);
             }
 
-            if (intent.getBooleanExtra(NEW_OUTGOING_CALL, false)) {
-                intent.removeExtra(NEW_OUTGOING_CALL);
+            if (intent.getBooleanExtra(NEW_OUTGOING_CALL_EXTRA, false)) {
+                intent.removeExtra(NEW_OUTGOING_CALL_EXTRA);
                 Call call = CallList.getInstance().getOutgoingCall();
                 if (call == null) {
                     call = CallList.getInstance().getPendingOutgoingCall();
@@ -543,7 +558,6 @@ public class InCallActivity extends Activity {
                     extras = new Bundle();
                 }
 
-
                 Point touchPoint = null;
                 if (TouchPointManager.getInstance().hasValidPoint()) {
                     // Use the most immediate touch point in the InCallUi if available
@@ -554,23 +568,21 @@ public class InCallActivity extends Activity {
                         touchPoint = (Point) extras.getParcelable(TouchPointManager.TOUCH_POINT);
                     }
                 }
-                mCallCardFragment.animateForNewOutgoingCall(touchPoint);
 
-                /*
-                 * If both a phone account handle and a list of phone accounts to choose from are
-                 * missing, then disconnect the call because there is no way to place an outgoing
-                 * call.
-                 * The exception is emergency calls, which may be waiting for the ConnectionService
-                 * to set the PhoneAccount during the PENDING_OUTGOING state.
-                 */
-                if (call != null && !isEmergencyCall(call)) {
-                    final List<PhoneAccountHandle> phoneAccountHandles = extras
-                            .getParcelableArrayList(android.telecom.Call.AVAILABLE_PHONE_ACCOUNTS);
-                    if (call.getAccountHandle() == null &&
-                            (phoneAccountHandles == null || phoneAccountHandles.isEmpty())) {
-                        TelecomAdapter.getInstance().disconnectCall(call.getId());
-                    }
+                // This is only true in the case where an outgoing call is initiated by tapping
+                // on the "Select account dialog", in which case we skip the initial animation. In
+                // most other cases the circular reveal is done by OutgoingCallAnimationActivity.
+                final boolean showCircularReveal =
+                        intent.getBooleanExtra(SHOW_CIRCULAR_REVEAL_EXTRA, false);
+                mCallCardFragment.animateForNewOutgoingCall(touchPoint, showCircularReveal);
+
+                // InCallActivity is responsible for disconnecting a new outgoing call if there
+                // is no way of making it (i.e. no valid call capable accounts)
+                if (InCallPresenter.isCallWithNoValidAccounts(call)) {
+                    TelecomAdapter.getInstance().disconnectCall(call.getId());
                 }
+
+                dismissKeyguard(true);
             }
 
             Call pendingAccountSelectionCall = CallList.getInstance().getWaitingForAccountCall();
@@ -587,22 +599,28 @@ public class InCallActivity extends Activity {
                     phoneAccountHandles = new ArrayList<>();
                 }
 
+                SelectPhoneAccountListener listener = new SelectPhoneAccountListener() {
+                    @Override
+                    public void onPhoneAccountSelected(PhoneAccountHandle selectedAccountHandle,
+                            boolean setDefault) {
+                        InCallPresenter.getInstance().handleAccountSelection(selectedAccountHandle,
+                                setDefault);
+                    }
+                    @Override
+                    public void onDialogDismissed() {
+                        InCallPresenter.getInstance().cancelAccountSelection();
+                    }
+                };
+
                 SelectPhoneAccountDialogFragment.showAccountDialog(getFragmentManager(),
-                        phoneAccountHandles);
+                        R.string.select_phone_account_for_calls, true, phoneAccountHandles,
+                        listener);
             } else {
                 mCallCardFragment.setVisible(true);
             }
 
             return;
         }
-    }
-
-    private boolean isEmergencyCall(Call call) {
-        final Uri handle = call.getHandle();
-        if (handle == null) {
-            return false;
-        }
-        return PhoneNumberUtils.isEmergencyNumber(handle.getSchemeSpecificPart());
     }
 
     private void relaunchedFromDialer(boolean showDialpad) {
@@ -643,10 +661,6 @@ public class InCallActivity extends Activity {
                     .findFragmentById(R.id.conferenceManagerFragment);
             mConferenceManagerFragment.getView().setVisibility(View.INVISIBLE);
         }
-
-        if (AudioModeProvider.getInstance() != null) {
-            AudioModeProvider.getInstance().setInCallActivity(this);
-        }
     }
 
     /**
@@ -658,6 +672,10 @@ public class InCallActivity extends Activity {
     }
 
     public void dismissKeyguard(boolean dismiss) {
+        if (mDismissKeyguard == dismiss) {
+            return;
+        }
+        mDismissKeyguard = dismiss;
         if (dismiss) {
             getWindow().addFlags(WindowManager.LayoutParams.FLAG_DISMISS_KEYGUARD);
         } else {
@@ -712,8 +730,18 @@ public class InCallActivity extends Activity {
         return mDialpadFragment != null && mDialpadFragment.isVisible();
     }
 
-    public void showConferenceCallManager() {
-        mConferenceManagerFragment.setVisible(true);
+    /**
+     * Hides or shows the conference manager fragment.
+     *
+     * @param show {@code true} if the conference manager should be shown, {@code false} if it
+     *                         should be hidden.
+     */
+    public void showConferenceCallManager(boolean show) {
+        mConferenceManagerFragment.setVisible(show);
+
+        // Need to hide the call card fragment to ensure that accessibility service does not try to
+        // give focus to the call card when the conference manager is visible.
+        mCallCardFragment.getView().setVisibility(show ? View.GONE : View.VISIBLE);
     }
 
     public void showPostCharWaitDialog(String callId, String chars) {
@@ -817,7 +845,7 @@ public class InCallActivity extends Activity {
             default:
                 // Attempt to use a service we don't recognize or support
                 // ("Unsupported service" or "Selected service failed")
-               errorMessageResId = R.string.incall_error_supp_service_unknown;
+                errorMessageResId = R.string.incall_error_supp_service_unknown;
                 break;
         }
         final CharSequence msg = getResources().getText(errorMessageResId);
@@ -834,7 +862,7 @@ public class InCallActivity extends Activity {
 
         mDialog = new AlertDialog.Builder(this)
                 .setMessage(msg)
-                .setPositiveButton(R.string.ok, new OnClickListener() {
+                .setPositiveButton(android.R.string.ok, new OnClickListener() {
                     @Override
                     public void onClick(DialogInterface dialog, int which) {
                         onDialogDismissed();
@@ -882,7 +910,7 @@ public class InCallActivity extends Activity {
         ActionBar bar = getActionBar();
 
         for (int i = 0; i < phoneCount; i++) {
-            long[] subId = CallList.getInstance().getSubId(i);
+            int[] subId = CallList.getInstance().getSubId(i);
             if (subId != null && CallList.getInstance().hasAnyLiveCall(subId[0])) {
                 if (!mDsdaTabAdd[i]) {
                     addDsdaTab(i);
@@ -950,7 +978,7 @@ public class InCallActivity extends Activity {
             //setting active subscription automatically when call on one sub
             //ends and it's corresponding tab is removed.For such cases active
             //subscription will be set by InCallPresenter.attemptFinishActivity.
-            long[] subId = CallList.getInstance().getSubId(mPhoneId);
+            int[] subId = CallList.getInstance().getSubId(mPhoneId);
             if (tabCount != TAB_COUNT_ONE && CallList.getInstance().hasAnyLiveCall(subId[0])
                     && (CallList.getInstance().getActiveSubscription() != subId[0])) {
                 Log.i(this, "Switch to other active sub: " + subId[0]);

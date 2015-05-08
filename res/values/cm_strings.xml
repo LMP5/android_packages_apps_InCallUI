@@ -27,6 +27,9 @@
     <!-- In-call screen: status label for a call in the "dialing" state that's waiting for the busy remote side -->
     <string name="card_title_dialing_waiting">Dialing (waiting\u2026)</string>
 
+    <!-- In-call screen: status label for a call that is held remotely -->
+    <string name="card_title_waiting_call">Call on hold</string>
+
     <!-- Text for the onscreen "Blacklist" button -->
     <string name="onscreenBlacklistText">Blacklist</string>
 
@@ -64,15 +67,13 @@
     <!-- Message indicating unknown call session event -->
     <string name="unknown_call_session_event">Unknown call session event</string>
 
-    <string name="volume_boost_notify_enabled">Volume boost is enabled</string>
-    <string name="volume_boost_notify_disabled">Volume boost is disabled</string>
-    <string name="volume_boost_notify_unavailable">Extra volume is not available when using a headset</string>
-    <string name="volume_boost_toast_position" translatable="false">600</string>
-
-    <string name="onscreenMoreMenuText">More options</string>
+    <string name="onscreenCallRecordText">Start and stop call recording</string>
+    <string name="onscreenAddToBlacklistText">Add caller to blacklist</string>
     <string name="menu_start_record">Record call</string>
     <string name="menu_stop_record">Stop recording</string>
     <string name="recording_time_text">Recording</string>
+    <string name="recording_warning_title">Enable call recording?</string>
+    <string name="recording_warning_text">Notice:  You are responsible for compliance with any laws, regulations and rules that apply to the use of call recording functionality and the use or distribution of those recordings.</string>
 
     <!-- Set Subscription screen: label sub 1 -->
     <string name="sub_1">SIM 1</string>

@@ -17,17 +17,17 @@
 package com.android.incallui;
 
 import android.Manifest;
-import android.app.AlertDialog;
 import android.content.Context;
-import android.content.DialogInterface;
 import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.graphics.drawable.Drawable;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.provider.Settings;
+import android.telecom.AudioState;
 import android.telecom.DisconnectCause;
-import android.telecom.PhoneCapabilities;
 import android.telecom.PhoneAccount;
 import android.telecom.PhoneAccountHandle;
 import android.telecom.StatusHints;
@@ -37,8 +37,8 @@ import android.telephony.PhoneNumberUtils;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
 import android.text.TextUtils;
-import android.text.format.DateUtils;
 
+import com.android.incallui.AudioModeProvider.AudioModeListener;
 import com.android.incallui.ContactInfoCache.ContactCacheEntry;
 import com.android.incallui.ContactInfoCache.ContactInfoCacheCallback;
 import com.android.incallui.InCallPresenter.InCallDetailsListener;
@@ -50,7 +50,6 @@ import com.android.incalluibind.ObjectFactory;
 
 import java.lang.ref.WeakReference;
 
-import com.android.internal.telephony.util.BlacklistUtils;
 import com.google.common.base.Preconditions;
 
 /**
@@ -58,9 +57,9 @@ import com.google.common.base.Preconditions;
  * <p>
  * This class listens for changes to InCallState and passes it along to the fragment.
  */
-public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
-        implements InCallStateListener, IncomingCallListener, InCallDetailsListener,
-        InCallEventListener {
+public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi> implements
+        InCallStateListener, IncomingCallListener, InCallDetailsListener,
+        InCallEventListener, AudioModeListener {
 
     private static final String TAG = CallCardPresenter.class.getSimpleName();
     private static final long CALL_TIME_UPDATE_INTERVAL_MS = 1000;
@@ -70,13 +69,15 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
     private static final String IDP_ZERO = "0";
     private static final String IDP_PREFIX = "01033";
 
+    private static final String VOLUME_BOOST_PARAMETER = "volume_boost";
+
     private Call mPrimary;
     private Call mSecondary;
     private ContactCacheEntry mPrimaryContactInfo;
     private ContactCacheEntry mSecondaryContactInfo;
     private CallTimer mCallTimer;
     private Context mContext;
-    private TelecomManager mTelecomManager;
+    private AudioManager mAudioManager;
 
     public static class ContactLookupCallback implements ContactInfoCacheCallback {
         private final WeakReference<CallCardPresenter> mCallCardPresenter;
@@ -117,6 +118,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
 
     public void init(Context context, Call call) {
         mContext = Preconditions.checkNotNull(context);
+        mAudioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
 
         // Call may be null if disconnect happened already.
         if (call != null) {
@@ -145,6 +147,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         InCallPresenter.getInstance().addIncomingCallListener(this);
         InCallPresenter.getInstance().addDetailsListener(this);
         InCallPresenter.getInstance().addInCallEventListener(this);
+        AudioModeProvider.getInstance().addListener(this);
     }
 
     @Override
@@ -156,6 +159,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         InCallPresenter.getInstance().removeIncomingCallListener(this);
         InCallPresenter.getInstance().removeDetailsListener(this);
         InCallPresenter.getInstance().removeInCallEventListener(this);
+        AudioModeProvider.getInstance().removeListener(this);
 
         mPrimary = null;
         mPrimaryContactInfo = null;
@@ -240,7 +244,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         } else {
             Log.d(this, "Canceling the calltime timer");
             mCallTimer.cancel();
-            ui.setPrimaryCallElapsedTime(false, null);
+            ui.setPrimaryCallElapsedTime(false, 0);
         }
 
         // Set the call state
@@ -260,6 +264,11 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                     false);
         }
 
+        if (!callList.hasAnyLiveCall() && isVolumeBoostEnabled()) {
+            setVolumeBoost(false);
+        }
+        updateVBButton();
+
         // Hide/show the contact photo based on the video state.
         // If the primary call is a video call on hold, still show the contact photo.
         // If the primary call is an active video call, hide the contact photo.
@@ -270,21 +279,58 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
 
         maybeShowManageConferenceCallButton();
 
+        //Note that both primary and secondary calls can be modified
+        final boolean isModifyRequest = isPendingModifyRequest(mPrimary) ||
+                isPendingModifyRequest(mSecondary);
+
         final boolean enableEndCallButton = Call.State.isConnectingOrConnected(callState) &&
-                callState != Call.State.INCOMING && mPrimary != null;
-        // Hide the end call button instantly if we're receiving an incoming call.
+                callState != Call.State.INCOMING && mPrimary != null && !isModifyRequest;
+        /* Hide the end call button instantly if we're receiving an incoming call
+           or when receiving a modify request */
         getUi().setEndCallButtonEnabled(
-                enableEndCallButton, callState != Call.State.INCOMING /* animate */);
+                enableEndCallButton, callState != Call.State.INCOMING &&
+                !isModifyRequest /* animate */);
+    }
+
+    //Return TRUE if there is a modify request pending user action
+    boolean isPendingModifyRequest(Call call) {
+        return (call != null && call.getSessionModificationState() ==
+                Call.SessionModificationState.RECEIVED_UPGRADE_TO_VIDEO_REQUEST);
+
     }
 
     @Override
     public void onDetailsChanged(Call call, android.telecom.Call.Details details) {
         updatePrimaryCallState();
 
-        if (call.can(PhoneCapabilities.MANAGE_CONFERENCE) != PhoneCapabilities.can(
-                details.getCallCapabilities(), PhoneCapabilities.MANAGE_CONFERENCE)) {
+        if (call.can(android.telecom.Call.Details.CAPABILITY_MANAGE_CONFERENCE) !=
+                android.telecom.Call.Details.can(
+                        details.getCallCapabilities(),
+                        android.telecom.Call.Details.CAPABILITY_MANAGE_CONFERENCE)) {
             maybeShowManageConferenceCallButton();
         }
+    }
+
+    @Override
+    public void onAudioMode(int mode) {
+        if (mAudioManager == null) {
+            return;
+        }
+        if (mode == AudioState.ROUTE_EARPIECE || mode == AudioState.ROUTE_BLUETOOTH
+                || mode == AudioState.ROUTE_WIRED_HEADSET || mode == AudioState.ROUTE_SPEAKER) {
+            setVolumeBoost(false);
+            updateVBButton();
+        }
+    }
+
+    @Override
+    public void onSupportedAudioMode(int mask) {
+        // ignored
+    }
+
+    @Override
+    public void onMute(boolean muted) {
+        // ignored
     }
 
     private String getSubscriptionNumber() {
@@ -293,8 +339,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         // number directly from the telephony layer).
         PhoneAccountHandle accountHandle = mPrimary.getAccountHandle();
         if (accountHandle != null) {
-            TelecomManager mgr =
-                    (TelecomManager) mContext.getSystemService(Context.TELECOM_SERVICE);
+            TelecomManager mgr = InCallPresenter.getInstance().getTelecomManager();
             PhoneAccount account = mgr.getPhoneAccount(accountHandle);
             if (account != null) {
                 return getNumberFromHandle(account.getSubscriptionAddress());
@@ -311,7 +356,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                     mPrimary.getSessionModificationState(),
                     mPrimary.getDisconnectCause(),
                     getConnectionLabel(),
-                    getConnectionIcon(),
+                    getCallStateIcon(),
                     getGatewayNumber(),
                     mPrimary.isWaitingForRemoteSide());
             setCallbackNumber();
@@ -336,7 +381,8 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
             return false;
         }
 
-        return mPrimary.can(PhoneCapabilities.MANAGE_CONFERENCE);
+        return mPrimary.can(android.telecom.Call.Details.CAPABILITY_MANAGE_CONFERENCE) &&
+                !mPrimary.isVideoCall(mContext);
     }
 
     private void setCallbackNumber() {
@@ -356,9 +402,8 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
             }
         }
 
-        TelephonyManager telephonyManager =
-                (TelephonyManager) mContext.getSystemService(Context.TELEPHONY_SERVICE);
-        String simNumber = telephonyManager.getLine1Number();
+        TelecomManager mgr = InCallPresenter.getInstance().getTelecomManager();
+        String simNumber = mgr.getLine1Number(mPrimary.getAccountHandle());
         if (PhoneNumberUtils.compare(callbackNumber, simNumber)) {
             Log.d(this, "Numbers are the same; not showing the callback number");
             callbackNumber = null;
@@ -372,13 +417,13 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
 
         if (ui == null || mPrimary == null || mPrimary.getState() != Call.State.ACTIVE) {
             if (ui != null) {
-                ui.setPrimaryCallElapsedTime(false, null);
+                ui.setPrimaryCallElapsedTime(false, 0);
             }
             mCallTimer.cancel();
         } else {
             final long callStart = mPrimary.getConnectTimeMillis();
             final long duration = System.currentTimeMillis() - callStart;
-            ui.setPrimaryCallElapsedTime(true, DateUtils.formatElapsedTime(duration / 1000));
+            ui.setPrimaryCallElapsedTime(true, duration);
         }
     }
 
@@ -408,6 +453,13 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
     }
 
     private void onContactInfoComplete(String callId, ContactCacheEntry entry, boolean isPrimary) {
+        Call call = (isPrimary ? mPrimary: mSecondary);
+        Log.d(TAG, "onContactInfoComplete: callId = " + callId + " isPrimary = " + isPrimary
+                + " call = " + call);
+        if (call == null || callId == null || !callId.equals(call.getId())) {
+            Log.d(TAG, "onContactInfoComplete: contact info is not for the current call.");
+            return;
+        }
         updateContactEntry(entry, isPrimary);
         if (entry.name != null) {
             Log.d(TAG, "Contact found: " + entry);
@@ -500,7 +552,6 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
             return;
         }
 
-        final boolean isForwarded = isForwarded(mPrimary);
         if (mPrimary.isConferenceCall()) {
             Log.d(TAG, "Update primary display info for conference call.");
 
@@ -508,7 +559,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                     null /* number */,
                     getConferenceString(mPrimary),
                     false /* nameIsNumber */,
-                    isForwarded,
+                    isForwarded(mPrimary),
                     null /* label */,
                     getConferencePhoto(mPrimary),
                     false /* isSipCall */,
@@ -519,9 +570,12 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
             String name = getNameForCall(mPrimaryContactInfo);
             String number = getNumberForCall(mPrimaryContactInfo);
             boolean nameIsNumber = name != null && name.equals(mPrimaryContactInfo.number);
+            boolean isIncoming = mPrimary.getState() == Call.State.INCOMING;
+            final boolean isForwarded = isForwarded(mPrimary);
+            final String checkIdpName = checkIdp(name, nameIsNumber, isIncoming);
             ui.setPrimary(
                     number,
-                    name,
+                    checkIdpName,
                     nameIsNumber,
                     isForwarded,
                     mPrimaryContactInfo.label,
@@ -549,7 +603,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         return number;
     }
 
-    private boolean isCDMAPhone(long subscription) {
+    private boolean isCDMAPhone(int subscription) {
         boolean isCDMA = false;
         int phoneType = TelephonyManager.getDefault().isMultiSimEnabled()
                 ? TelephonyManager.getDefault().getCurrentPhoneType(subscription)
@@ -560,7 +614,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         return isCDMA;
     }
 
-    private boolean isRoaming(long subscription) {
+    private boolean isRoaming(int subscription) {
         if (TelephonyManager.getDefault().isMultiSimEnabled()) {
             return TelephonyManager.getDefault().isNetworkRoaming(subscription);
         } else {
@@ -576,7 +630,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
 
         if (mSecondary == null) {
             // Clear the secondary display info.
-            ui.setSecondary(false, null, false, null, null, null, false /* isConference */);
+            ui.setSecondary(false, null, false, null, null, false /* isConference */);
             return;
         }
 
@@ -587,7 +641,6 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                     false /* nameIsNumber */,
                     null /* label */,
                     getCallProviderLabel(mSecondary),
-                    getCallProviderIcon(mSecondary),
                     true /* isConference */);
         } else if (mSecondaryContactInfo != null) {
             Log.d(TAG, "updateSecondaryDisplayInfo() " + mSecondaryContactInfo);
@@ -599,11 +652,10 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                     nameIsNumber,
                     mSecondaryContactInfo.label,
                     getCallProviderLabel(mSecondary),
-                    getCallProviderIcon(mSecondary),
                     false /* isConference */);
         } else {
             // Clear the secondary display info.
-            ui.setSecondary(false, null, false, null, null, null, false /* isConference */);
+            ui.setSecondary(false, null, false, null, null, false /* isConference */);
         }
     }
 
@@ -616,7 +668,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         if (accountHandle == null) {
             return null;
         }
-        return getTelecomManager().getPhoneAccount(accountHandle);
+        return InCallPresenter.getInstance().getTelecomManager().getPhoneAccount(accountHandle);
     }
 
     /**
@@ -630,30 +682,13 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
     }
 
     /**
-     * Return the Drawable object of the icon to display to the left of the connection label.
-     */
-    private Drawable getCallProviderIcon(Call call) {
-        PhoneAccount account = getAccountForCall(call);
-
-        // on MSIM devices irrespective of number of enabled phone
-        // accounts pick icon from phone account and display on UI
-        if (account != null && (getTelecomManager().hasMultipleCallCapableAccounts()
-                || (CallList.PHONE_COUNT > 1))) {
-            return account.getIcon(mContext);
-        }
-        return null;
-    }
-
-    /**
      * Return the string label to represent the call provider
      */
     private String getCallProviderLabel(Call call) {
         PhoneAccount account = getAccountForCall(call);
-
-        // on MSIM devices irrespective of number of
-        // enabled phone accounts display label info on UI
-        if (account != null && (getTelecomManager().hasMultipleCallCapableAccounts()
-                || (CallList.PHONE_COUNT > 1))) {
+        TelecomManager mgr = InCallPresenter.getInstance().getTelecomManager();
+        if (account != null && !TextUtils.isEmpty(account.getLabel())
+                && mgr.hasMultipleCallCapableAccounts()) {
             return account.getLabel().toString();
         }
         return null;
@@ -684,7 +719,8 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         return getCallProviderLabel(mPrimary);
     }
 
-    private Drawable getConnectionIcon() {
+    private Drawable getCallStateIcon() {
+        // Return connection icon if one exists.
         StatusHints statusHints = mPrimary.getTelecommCall().getDetails().getStatusHints();
         if (statusHints != null && statusHints.getIconResId() != 0) {
             Drawable icon = statusHints.getIcon(mContext);
@@ -692,7 +728,15 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                 return icon;
             }
         }
-        return getCallProviderIcon(mPrimary);
+
+        // Return high definition audio icon if the capability is indicated.
+        if (mPrimary.getTelecommCall().getDetails().can(
+                android.telecom.Call.Details.CAPABILITY_HIGH_DEF_AUDIO)
+                && mPrimary.getState() == Call.State.ACTIVE) {
+            return mContext.getResources().getDrawable(R.drawable.ic_hd_audio);
+        }
+
+        return null;
     }
 
     private boolean hasOutgoingGatewayCall() {
@@ -732,7 +776,7 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
 
     public void secondaryInfoClicked() {
         if (mSecondary == null) {
-            Log.wtf(this, "Secondary info clicked but no secondary call.");
+            Log.w(this, "Secondary info clicked but no secondary call.");
             return;
         }
 
@@ -749,6 +793,56 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         mPrimary.setState(Call.State.DISCONNECTING);
         CallList.getInstance().onUpdate(mPrimary);
         TelecomAdapter.getInstance().disconnectCall(mPrimary.getId());
+    }
+
+    public void volumeBoostClicked() {
+        if (isVBAvailable()) {
+            setVolumeBoost(!isVolumeBoostEnabled());
+        }
+
+        updateVBButton();
+    }
+
+    private boolean isVBAvailable() {
+        if (mPrimary == null || mPrimary.getState() != Call.State.ACTIVE) {
+            return false;
+        }
+
+        if (isVBHiddenByOverride()) {
+            return false;
+        }
+
+        int mode = AudioModeProvider.getInstance().getAudioMode();
+        int settingsTtyMode = Settings.Secure.getInt(mContext.getContentResolver(),
+                Settings.Secure.PREFERRED_TTY_MODE, TelecomManager.TTY_MODE_OFF);
+
+        if (mode != AudioState.ROUTE_EARPIECE && mode != AudioState.ROUTE_SPEAKER
+                && settingsTtyMode != TelecomManager.TTY_MODE_HCO) {
+            return false;
+        }
+
+        return !TextUtils.isEmpty(mAudioManager.getParameters(VOLUME_BOOST_PARAMETER));
+    }
+
+    private boolean isVolumeBoostEnabled() {
+        return mAudioManager.getParameters(VOLUME_BOOST_PARAMETER).contains("=on");
+    }
+
+    private void setVolumeBoost(boolean on) {
+        final String value = on ? "=on" : "=off";
+        mAudioManager.setParameters(VOLUME_BOOST_PARAMETER + value);
+    }
+
+    private boolean isVBHiddenByOverride() {
+        return mContext.getResources().getBoolean(R.bool.config_disable_audio_boost);
+    }
+
+    private void updateVBButton() {
+        boolean show = isVBAvailable();
+        boolean on = show && isVolumeBoostEnabled();
+        if (getUi() != null) {
+            getUi().setVolumeBoostButtonState(show, on);
+        }
     }
 
     private String getNumberFromHandle(Uri handle) {
@@ -769,40 +863,9 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         ui.setCallCardVisible(!isFullScreenVideo);
     }
 
-    public void blacklistClicked(final Context context) {
-        if (mPrimary == null) {
-            return;
-        }
-
-        final String number = mPrimary.getNumber();
-        final String message = context.getString(R.string.blacklist_dialog_message, number);
-
-        new AlertDialog.Builder(context)
-                .setTitle(R.string.blacklist_dialog_title)
-                .setMessage(message)
-                .setPositiveButton(R.string.pause_prompt_yes, new DialogInterface.OnClickListener() {
-                    @Override
-                    public void onClick(DialogInterface dialog, int which) {
-                        Log.d(this, "hanging up due to blacklist: " + mPrimary.getId());
-                        TelecomAdapter.getInstance().disconnectCall(mPrimary.getId());
-                        BlacklistUtils.addOrUpdate(context, mPrimary.getNumber(),
-                                BlacklistUtils.BLOCK_CALLS, BlacklistUtils.BLOCK_CALLS);
-                    }
-                })
-                .setNegativeButton(R.string.pause_prompt_no, null)
-                .show();
-    }
-
-    private TelecomManager getTelecomManager() {
-        if (mTelecomManager == null) {
-            mTelecomManager =
-                    (TelecomManager) mContext.getSystemService(Context.TELECOM_SERVICE);
-        }
-        return mTelecomManager;
-    }
-
     private String getConferenceString(Call call) {
-        boolean isGenericConference = call.can(PhoneCapabilities.GENERIC_CONFERENCE);
+        boolean isGenericConference = call.can(
+                android.telecom.Call.Details.CAPABILITY_GENERIC_CONFERENCE);
         Log.v(this, "getConferenceString: " + isGenericConference);
 
         final int resId = isGenericConference
@@ -811,7 +874,8 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
     }
 
     private Drawable getConferencePhoto(Call call) {
-        boolean isGenericConference = call.can(PhoneCapabilities.GENERIC_CONFERENCE);
+        boolean isGenericConference = call.can(
+                android.telecom.Call.Details.CAPABILITY_GENERIC_CONFERENCE);
         Log.v(this, "getConferencePhoto: " + isGenericConference);
 
         final int resId = isGenericConference
@@ -828,11 +892,11 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
                 String label, Drawable photo, boolean isSipCall,
                 String nickName, String organization, String position, String city);
         void setSecondary(boolean show, String name, boolean nameIsNumber, String label,
-                String providerLabel, Drawable providerIcon, boolean isConference);
+                String providerLabel, boolean isConference);
         void setCallState(int state, int videoState, int sessionModificationState,
                 DisconnectCause disconnectCause, String connectionLabel,
                 Drawable connectionIcon, String gatewayNumber, boolean isWaitingForRemoteSide);
-        void setPrimaryCallElapsedTime(boolean show, String duration);
+        void setPrimaryCallElapsedTime(boolean show, long duration);
         void setPrimaryName(String name, boolean nameIsNumber);
         void setPrimaryImage(Drawable image);
         void setPrimaryPhoneNumber(String phoneNumber);
@@ -841,11 +905,12 @@ public class CallCardPresenter extends Presenter<CallCardPresenter.CallCardUi>
         void setCallbackNumber(String number, boolean isEmergencyCalls);
         void setPhotoVisible(boolean isVisible);
         void setProgressSpinnerVisible(boolean visible);
+        void setVolumeBoostButtonState(boolean visible, boolean on);
         void showManageConferenceCallButton(boolean visible);
         boolean isManageConferenceVisible();
     }
 
-    public long getActiveSubscription() {
+    public int getActiveSubscription() {
         return SubscriptionManager.getDefaultSubId();
     }
 }
